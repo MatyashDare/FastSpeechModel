@@ -1,71 +1,37 @@
 import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader
+
+import wandb
+from tqdm import tqdm
+
+
+from typing import Tuple, Dict, Optional, List, Union
+import torch
 from torch import nn
 import torchaudio
-import numpy as np
-import math
-from typing import Tuple, Dict, Optional, List, Union
 from dataclasses import dataclass
 from matplotlib import pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
-import librosa
-
-from typing import Tuple, Dict, Optional, List, Union
-from itertools import islice
-from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from dataclasses import dataclass
+from src.data.melspectrogram import MelSpectrogramConfig
 
 
-# --- LJSpeechDataset --- 
-class LJSpeechDataset(torchaudio.datasets.LJSPEECH):
 
-    def __init__(self, root):
-        super().__init__(root=root)
-        self._tokenizer = torchaudio.pipelines.TACOTRON2_GRIFFINLIM_CHAR_LJSPEECH.get_text_processor()
 
-    def __getitem__(self, index: int):
-        waveform, _, _, transcript = super().__getitem__(index)
-        duration_multiplayers = torch.from_numpy(np.load(f'alignments/{index}.npy'))
-        waveforn_length = torch.tensor([waveform.shape[-1]]).int()
-        transcript = transcript.lower()
-        transcript = transcript.replace("mr.", "mister")
-        transcript = transcript.replace("ms.", "miss")
-        transcript = transcript.replace("mrs.", "misses")
-        tokens, token_lengths = self._tokenizer(transcript)
-
-        return waveform, waveforn_length, transcript, tokens, token_lengths, duration_multiplayers
-
-    def decode(self, tokens, lengths):
-        ans = []
-        for tokens_, length in zip(tokens, lengths):
-            sentence = "".join([self._tokenizer.tokens[tok] for tok in tokens_[:length]])
-            ans.append(sentence)
-        return ans
-    
-    
-@dataclass
-class Point:
-    token_index: int
-    time_index: int
-    score: float
 
 
 @dataclass
 class Segment:
-    label: str
-    start: int
-    end: int
-    score: float
+
 
     def __repr__(self):
-        return f"{self.label}\t({self.score:4.2f}): [{self.start:5d}, {self.end:5d})"
+        return "{self.label}\t({self.score:4.2f}): [{self.start:5d}, {self.end:5d})"
 
     @property
     def length(self):
         return self.end - self.start
 
 
-# --- GraphemeAligner --- 
 class GraphemeAligner(nn.Module):
 
     def __init__(self):
@@ -203,9 +169,19 @@ class GraphemeAligner(nn.Module):
         for i, p in enumerate(path):
             trellis_with_path[p.time_index, p.token_index] = float('nan')
         plt.imshow(trellis_with_path[1:, 1:].T, origin='lower')
-        
 
-        
+
+
+from typing import Tuple, Dict, Optional, List, Union
+from itertools import islice
+import torch
+from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from dataclasses import dataclass
+from src.data.aligner import GraphemeAligner
+from src.data.melspectrogram import MelSpectrogram, MelSpectrogramConfig
+
+
 @dataclass
 class Batch:
     waveform: torch.Tensor
@@ -221,35 +197,89 @@ class Batch:
         raise NotImplementedError
 
 
-# --- LJSpeechCollato --- 
 class LJSpeechCollator:
     def __init__(self, device='cpu'):
-        self.device = device
+        self.aligner = GraphemeAligner().to(device)
         self.featurizer = MelSpectrogram(MelSpectrogramConfig()).to(device)
         self.hop_length = MelSpectrogramConfig().hop_length
 
     def __call__(self, instances: List[Tuple]) -> Dict:
-        waveform, waveforn_length, transcript, tokens, token_lengths, fp_duration_multiplayers = list(
-            zip(*instances))
-        waveform = pad_sequence([waveform_[0] for waveform_ in waveform]).transpose(0, 1).to(self.device)
+        waveform, waveforn_length, transcript, tokens, token_lengths = list(
+            zip(*instances)
+        )
+        waveform = pad_sequence([
+            waveform_[0] for waveform_ in waveform
+        ]).transpose(0, 1)
         waveforn_length = torch.cat(waveforn_length)
-        tokens = pad_sequence([tokens_[0] for tokens_ in tokens]).transpose(0, 1).to(self.device)
-        token_lengths = torch.cat(token_lengths)
-        duration_multipliers = pad_sequence([dur for dur in fp_duration_multipliers]).transpose(0, 1).to(self.device)
-        melspec = self.featurizer(waveform)
-        duration_multipliers = duration_multipliers[:, :tokens.shape[1]]
-        d = {"waveform" : waveform,
-                "waveforn_length" : waveforn_length // self.hop_length + 1.to(self.device),
-                "melspec" : melspec[:, :, :duration_multipliers.sum(1).max()],
-                "melspec_length" : melspec_length.to(self.device),
-                "transcript" : transcript,
-                "tokens" : tokens[:, :duration_multipliers.shape[1]],
-                "token_lengths" : token_lengths.to(self.device),
-                "duration_multipliers" : duration_multipliers.to(self.device)}
-        return d
 
-    
-    
+        tokens = pad_sequence([
+            tokens_[0] for tokens_ in tokens
+        ]).transpose(0, 1)
+        token_lengths = torch.cat(token_lengths)
+        melspec_length = waveforn_length // self.hop_length
+        durations = self.aligner(
+            waveform, waveforn_length, transcript
+        )
+        melspec = self.featurizer(waveform)
+        token_padded_length = tokens.shape[1]
+        melspec_padded_length = melspec.shape[2]
+        duration_multipliers = durations * melspec_length[:, None]
+
+        n_mels_for_padds = (melspec_padded_length - melspec_length) / (token_padded_length - token_lengths)
+        n_mels_for_padds[n_mels_for_padds.isinf()] = 0
+        padding_durations = (torch.arange(token_padded_length)[None, :] > token_lengths[:, None]) * n_mels_for_padds[:, None]
+        duration_multipliers += padding_durations
+        duration_multipliers = torch.round(duration_multipliers)
+
+        error = melspec_padded_length - duration_multipliers.sum(1)
+        error_shift = (torch.arange(token_padded_length)[None, :] < torch.abs(error)[:, None]).int() * torch.sign(error)[:, None]
+        duration_multipliers += error_shift
+        return {"waveform" : waveform,
+                "waveforn_length" : waveforn_length,
+                "melspec" : melspec,
+                "melspec_length" : melspec_length,
+                "transcript" : transcript,
+                "tokens" : tokens,
+                "token_lengths" : token_lengths,
+                "duration_multipliers" : duration_multipliers}
+
+
+
+import torch
+from torch import nn
+import torchaudio
+
+
+class LJSpeechDataset(torchaudio.datasets.LJSPEECH):
+
+    def __init__(self, root):
+        super().__init__(root=root)
+        self._tokenizer = torchaudio.pipelines.TACOTRON2_GRIFFINLIM_CHAR_LJSPEECH.get_text_processor()
+
+    def __getitem__(self, index: int):
+        waveform, _, _, transcript = super().__getitem__(index)
+        waveforn_length = torch.tensor([waveform.shape[-1]]).int()
+
+        tokens, token_lengths = self._tokenizer(transcript)
+
+        return waveform, waveforn_length, transcript, tokens, token_lengths
+
+    def decode(self, tokens, lengths):
+        result = []
+        for tokens_, length in zip(tokens, lengths):
+            text = "".join([
+                self._tokenizer.tokens[token]
+                for token in tokens_[:length]
+            ])
+            result.append(text)
+        return result
+mport torch
+from torch import nn
+import torchaudio
+import librosa
+from dataclasses import dataclass
+
+
 @dataclass
 class MelSpectrogramConfig:
     sr: int = 22050
@@ -307,3 +337,34 @@ class MelSpectrogram(nn.Module):
             .log_()
 
         return mel
+
+
+
+
+dataloader = DataLoader(LJSpeechDataset('.'), batch_size=10, collate_fn=LJSpeechCollator())
+model = FastSpeechModel(51, 10000, 1, 80, 30, 60, 9, nn.ReLU, 1, 128, 0)
+vocoder = Vocoder().eval()
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+
+log_audio_every = 250
+log_loss_every = 10
+
+with wandb.init(project="text_to_speech", name="batch_overfit") as run:
+    batch = next(iter(dataloader))
+    print(batch)
+    for i in tqdm(range(1, 5000)):
+        result = model(batch)
+        print(result.shape)
+        loss = criterion(result, batch['melspec'])
+        if i % log_loss_every == 0:
+            run.log({"loss" : loss})
+        if i % log_audio_every == 0:
+            print("Logging audio")
+            mel_to_log = result[0]
+            melspec_to_log  = result[0][:, :batch['melspec_length'][0]].unsqueeze(0)
+            reconstructed_wav = vocoder.inference(melspec_to_log).squeeze().detach().cpu().numpy()
+            run.log({"Audio" : wandb.Audio(reconstructed_wav, 22050)})
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
